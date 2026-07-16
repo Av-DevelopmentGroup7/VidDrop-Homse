@@ -1,0 +1,33 @@
+{
+  "name": "viddrop-homse",
+  "version": "2.0.0",
+  "description": "VidDrop - Powerful YouTube Video Downloader API Service. Search, download videos, extract audio, and stream content from YouTube using YouTube's InnerTube API.",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "nodemon server/index.js"
+  },
+  "keywords": [
+    "youtube",
+    "downloader",
+    "video",
+    "audio",
+    "m3u8",
+    "api",
+    "streaming",
+    "innertube"
+  ],
+  "author": "VidDrop",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.2",
+    "cors": "^2.8.5",
+    "youtubei.js": "^17.2.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
