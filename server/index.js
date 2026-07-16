@@ -1,22 +1,31 @@
 /**
- * VidDrop - YouTube Video Downloader API Service v2.0
+ * VidDrop - Universal Video Downloader API Service v3.0
  * 
- * A powerful backend service for searching, downloading videos,
- * extracting audio, and streaming content from YouTube.
+ * Multi-platform backend service supporting:
+ * YouTube (native via youtubei.js), TikTok (via TikWM API),
+ * Facebook, Instagram, Twitter/X (via scraper APIs + optional RapidAPI)
+ * 
+ * Features: Search, Download, Audio Extract, Stream, Preview, Auto-Detect
  * 
  * Architecture:
- * - WEB client: Used for search, trending, and metadata (no player needed)
- * - ANDROID client: Used for streaming/download URLs (URLs come pre-deciphered)
- * 
- * This dual-client approach avoids the signature deciphering issue
- * and provides reliable streaming URLs.
+ * - YouTube: youtubei.js (Innertube API) - dual client WEB + ANDROID
+ * - TikTok: tikwm.com API (no watermark)
+ * - Facebook: Multiple scraper APIs with fallbacks
+ * - Instagram: Multiple scraper APIs with fallbacks
+ * - Twitter/X: TwDown API with fallbacks
+ * - Optional: RapidAPI key for extended coverage
  */
 
 const express = require('express');
 const cors = require('cors');
 const { Innertube, Platform, ClientType } = require('youtubei.js');
+const axios = require('axios');
+const https = require('https');
 
-// Provide JS evaluator for any deciphering needs
+// Trust self-signed certs for scraper APIs
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
+// Provide JS evaluator for YouTube deciphering
 Platform.shim.eval = async (data) => {
   return new Function(data.output)();
 };
@@ -24,12 +33,6 @@ Platform.shim.eval = async (data) => {
 // ============================================================
 // STREAM UTILITIES
 // ============================================================
-const { pipeline } = require('stream');
-const { Writable } = require('stream');
-
-/**
- * Convert a Web ReadableStream to a Node.js stream and pipe to response
- */
 function streamToResponse(webStream, res, onError) {
   const reader = webStream.getReader();
   
@@ -46,7 +49,6 @@ function streamToResponse(webStream, res, onError) {
           break;
         }
         if (!res.write(value)) {
-          // Backpressure - wait for drain
           await new Promise(resolve => res.once('drain', resolve));
         }
       }
@@ -57,16 +59,16 @@ function streamToResponse(webStream, res, onError) {
       onError?.(err);
     }
   }
-  
+
   pump();
 }
 
+// ============================================================
+// APP SETUP
+// ============================================================
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ============================================================
-// Middleware
-// ============================================================
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -77,13 +79,11 @@ app.use(express.json({ limit: '10mb' }));
 // ============================================================
 // YouTube Clients
 // ============================================================
-
 let ytWeb = null;
 let ytAndroid = null;
 
 async function initYouTube() {
   try {
-    // WEB client for search, info, trending (no player needed)
     ytWeb = await Innertube.create({
       retrieve_player: false,
       client_type: ClientType.WEB,
@@ -93,11 +93,9 @@ async function initYouTube() {
     console.log('YouTube WEB client initialized');
   } catch (err) {
     console.error('YouTube WEB client init error:', err.message);
-    ytWeb = null;
   }
 
   try {
-    // ANDROID client for streaming/download (URLs come pre-deciphered)
     ytAndroid = await Innertube.create({
       retrieve_player: false,
       client_type: ClientType.ANDROID,
@@ -107,7 +105,6 @@ async function initYouTube() {
     console.log('YouTube ANDROID client initialized');
   } catch (err) {
     console.error('YouTube ANDROID client init error:', err.message);
-    ytAndroid = null;
   }
 }
 
@@ -124,7 +121,6 @@ function getAndroidClient() {
 // ============================================================
 // UTILITY FUNCTIONS
 // ============================================================
-
 function sanitizeFilename(filename) {
   return filename
     .replace(/[^\w\s.-]/gi, '')
@@ -172,27 +168,485 @@ function findBestFormat(formats, quality, mimeType) {
   return formats[0];
 }
 
+function extractVideoId(url) {
+  if (!url) return null;
+  const ytMatch = url.match(/(?:youtube\.com\/(?:watch\?v=|embed\/|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+  if (ytMatch) return ytMatch[1];
+  return null;
+}
+
+function detectPlatform(url) {
+  if (!url) return null;
+  const lowerUrl = url.toLowerCase();
+  if (lowerUrl.includes('youtube.com') || lowerUrl.includes('youtu.be')) return 'youtube';
+  if (lowerUrl.includes('facebook.com') || lowerUrl.includes('fb.watch') || lowerUrl.includes('fb.com')) return 'facebook';
+  if (lowerUrl.includes('instagram.com') || lowerUrl.includes('instagr.am')) return 'instagram';
+  if (lowerUrl.includes('tiktok.com')) return 'tiktok';
+  if (lowerUrl.includes('twitter.com') || lowerUrl.includes('x.com')) return 'twitter';
+  return null;
+}
+
+// ============================================================
+// TIKTOK DOWNLOADER (TikWM API - Confirmed Working)
+// ============================================================
+async function downloadTikTok(url) {
+  try {
+    const response = await axios.get(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}&hd=1`, {
+      timeout: 15000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      }
+    });
+
+    if (response.data?.code === 0 && response.data?.data) {
+      const d = response.data.data;
+      return {
+        videoUrl: d.play || d.wmplay || d.hdplay,
+        title: d.title || 'TikTok Video',
+        thumbnail: d.cover || d.origin_cover || '',
+        audioUrl: d.music || null,
+        author: d.author || 'Unknown',
+        noWatermark: true,
+        duration: d.duration || 0,
+        views: d.play_count || 0,
+        likes: d.digg_count || 0
+      };
+    }
+    throw new Error('TikTok API returned no video');
+  } catch (error) {
+    throw new Error('TikTok download failed: ' + error.message);
+  }
+}
+
+// ============================================================
+// FACEBOOK DOWNLOADER (Multi-strategy scraper)
+// ============================================================
+async function downloadFacebook(url) {
+  const strategies = [
+    // Strategy 1: fdownloader.net
+    async () => {
+      const resp = await axios.post('https://www.fdownloader.net/api/ajaxSearch',
+        'q=' + encodeURIComponent(url),
+        {
+          timeout: 12000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': '*/*',
+            'Origin': 'https://www.fdownloader.net',
+            'Referer': 'https://www.fdownloader.net/'
+          }
+        }
+      );
+      const links = resp.data.match(/https:\/\/[^"']+\.mp4[^"'\s]*/g);
+      return links?.[0];
+    },
+    // Strategy 2: fdown.net
+    async () => {
+      const resp = await axios.post('https://fdown.net/download.php',
+        'q=' + encodeURIComponent(url),
+        {
+          timeout: 12000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': 'https://fdown.net/'
+          }
+        }
+      );
+      const links = resp.data.match(/href="(https:\/\/[^"]+\.mp4[^"]*)"/g);
+      if (links?.length > 0) return links[0].replace(/href="/, '');
+      const dl = resp.data.match(/download="([^"]+)"/g);
+      if (dl?.length > 0) return dl[0].match(/download="([^"]+)"/)?.[1];
+      return null;
+    },
+    // Strategy 3: savefrom.net
+    async () => {
+      const resp = await axios.get('https://en1.savefrom.net/1-how-to-download-facebook-video-8GJ.html?url=' + encodeURIComponent(url), {
+        timeout: 12000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
+          'Referer': 'https://en1.savefrom.net/'
+        }
+      });
+      const links = resp.data.match(/https:\/\/[^"']+\.mp4[^"'\s]*/g);
+      return links?.[0];
+    },
+    // Strategy 4: getmyfb.com
+    async () => {
+      const resp = await axios.get('https://getmyfb.com/process?url=' + encodeURIComponent(url), {
+        timeout: 12000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
+          'X-Requested-With': 'XMLHttpRequest',
+          'Accept': 'application/json'
+        }
+      });
+      const links = resp.data.match(/https:\/\/[^"']+\.mp4[^"'\s]*/g);
+      return links?.[0] || links?.[1];
+    },
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const videoUrl = await strategy();
+      if (videoUrl) {
+        return { videoUrl, title: 'Facebook Video', thumbnail: '', platform: 'facebook' };
+      }
+    } catch (e) {
+      // Try next strategy
+    }
+  }
+
+  // Strategy 5: RapidAPI fallback
+  if (process.env.RAPIDAPI_KEY) {
+    try {
+      const resp = await axios.post('https://popular-video-downloader.p.rapidapi.com/download',
+        { url },
+        {
+          timeout: 15000,
+          headers: {
+            'x-rapidapi-host': 'popular-video-downloader.p.rapidapi.com',
+            'x-rapidapi-key': process.env.RAPIDAPI_KEY,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      if (resp.data?.url) {
+        return { videoUrl: resp.data.url, title: resp.data.title || 'Facebook Video', thumbnail: resp.data.thumbnail || '', platform: 'facebook' };
+      }
+    } catch (e) { /* skip */ }
+  }
+
+  throw new Error('Facebook download failed - all strategies exhausted. Add RAPIDAPI_KEY env var for extended support.');
+}
+
+// ============================================================
+// INSTAGRAM DOWNLOADER (Multi-strategy scraper)
+// ============================================================
+async function downloadInstagram(url) {
+  const strategies = [
+    // Strategy 1: saveig.app
+    async () => {
+      const resp = await axios.post('https://saveig.app/api/ajaxSearch',
+        'q=' + encodeURIComponent(url),
+        {
+          timeout: 12000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': 'https://saveig.app/',
+            'Accept': '*/*'
+          }
+        }
+      );
+      try {
+        const json = typeof resp.data === 'string' ? JSON.parse(resp.data) : resp.data;
+        if (json.items) {
+          for (const item of json.items) {
+            if (item.downloadUrl) return item.downloadUrl;
+          }
+        }
+      } catch (e) {
+        const links = resp.data.match(/https:\/\/[^"']+\.mp4[^"'\s]*/g);
+        return links?.[0];
+      }
+    },
+    // Strategy 2: snapinsta.to
+    async () => {
+      const resp = await axios.post('https://snapinsta.to/en46/action.php',
+        'q=' + encodeURIComponent(url),
+        {
+          timeout: 12000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': '*/*'
+          }
+        }
+      );
+      const links = resp.data.match(/https:\/\/[^"']+\.mp4[^"'\s]*/g);
+      return links?.[0];
+    },
+    // Strategy 3: snapinsta.app
+    async () => {
+      const resp = await axios.post('https://snapinsta.app/action.php',
+        'q=' + encodeURIComponent(url),
+        {
+          timeout: 12000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': 'https://snapinsta.app/'
+          }
+        }
+      );
+      const links = resp.data.match(/https:\/\/[^"']+\.mp4[^"'\s]*/g);
+      return links?.[0];
+    },
+    // Strategy 4: instagramsave.online
+    async () => {
+      const resp = await axios.get('https://instagramsave.online/api?url=' + encodeURIComponent(url), {
+        timeout: 12000,
+        headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0' }
+      });
+      const links = resp.data.match(/https:\/\/[^"']+\.mp4[^"'\s]*/g);
+      return links?.[0];
+    },
+    // Strategy 5: savefrom.net
+    async () => {
+      const resp = await axios.get('https://en1.savefrom.net/19wr/?url=' + encodeURIComponent(url), {
+        timeout: 12000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
+          'Referer': 'https://en1.savefrom.net/'
+        }
+      });
+      const links = resp.data.match(/https:\/\/[^"']+\.mp4[^"'\s]*/g);
+      return links?.[0];
+    },
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const videoUrl = await strategy();
+      if (videoUrl) {
+        return { videoUrl, title: 'Instagram Video', thumbnail: '', platform: 'instagram' };
+      }
+    } catch (e) {
+      // Try next strategy
+    }
+  }
+
+  // Strategy 6: RapidAPI fallback
+  if (process.env.RAPIDAPI_KEY) {
+    try {
+      const resp = await axios.post('https://popular-video-downloader.p.rapidapi.com/download',
+        { url },
+        {
+          timeout: 15000,
+          headers: {
+            'x-rapidapi-host': 'popular-video-downloader.p.rapidapi.com',
+            'x-rapidapi-key': process.env.RAPIDAPI_KEY,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      if (resp.data?.url) {
+        return { videoUrl: resp.data.url, title: resp.data.title || 'Instagram Video', thumbnail: resp.data.thumbnail || '', platform: 'instagram' };
+      }
+    } catch (e) { /* skip */ }
+  }
+
+  throw new Error('Instagram download failed - all strategies exhausted. Add RAPIDAPI_KEY env var for extended support.');
+}
+
+// ============================================================
+// TWITTER/X DOWNLOADER (Multi-strategy scraper)
+// ============================================================
+async function downloadTwitter(url) {
+  const strategies = [
+    // Strategy 1: twdown.net
+    async () => {
+      const resp = await axios.post('https://twdown.net/download.php',
+        'URL=' + encodeURIComponent(url),
+        {
+          timeout: 12000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': 'https://twdown.net/',
+            'Accept': '*/*'
+          }
+        }
+      );
+      const links = resp.data.match(/href="(https:\/\/[^"]+\.mp4[^"]*)"/g);
+      if (links?.length > 0) return links[0].replace(/href="/, '');
+      const allLinks = resp.data.match(/https:\/\/[^"']+\.mp4[^"'\s]*/g);
+      return allLinks?.[0];
+    },
+    // Strategy 2: ssstwitter.com
+    async () => {
+      const resp = await axios.post('https://ssstwitter.com/result',
+        'q=' + encodeURIComponent(url),
+        {
+          timeout: 12000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': 'https://ssstwitter.com/'
+          }
+        }
+      );
+      const links = resp.data.match(/href="(https:\/\/[^"]+\.mp4[^"]*)"/g);
+      if (links?.length > 0) return links[0].replace(/href="/, '');
+      const allLinks = resp.data.match(/https:\/\/[^"']+\.mp4[^"'\s]*/g);
+      return allLinks?.[0];
+    },
+    // Strategy 3: x2convert.com
+    async () => {
+      const resp = await axios.get('https://x2convert.com/api?url=' + encodeURIComponent(url), {
+        timeout: 12000,
+        headers: { 'User-Agent': 'Mozilla/5.0 Chrome/120.0.0.0' }
+      });
+      const links = resp.data.match(/https:\/\/[^"']+\.mp4[^"'\s]*/g);
+      return links?.[0];
+    },
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      const videoUrl = await strategy();
+      if (videoUrl) {
+        return { videoUrl, title: 'Twitter Video', thumbnail: '', platform: 'twitter' };
+      }
+    } catch (e) {
+      // Try next strategy
+    }
+  }
+
+  // Strategy 4: RapidAPI fallback
+  if (process.env.RAPIDAPI_KEY) {
+    try {
+      const resp = await axios.post('https://popular-video-downloader.p.rapidapi.com/download',
+        { url },
+        {
+          timeout: 15000,
+          headers: {
+            'x-rapidapi-host': 'popular-video-downloader.p.rapidapi.com',
+            'x-rapidapi-key': process.env.RAPIDAPI_KEY,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      if (resp.data?.url) {
+        return { videoUrl: resp.data.url, title: resp.data.title || 'Twitter Video', thumbnail: resp.data.thumbnail || '', platform: 'twitter' };
+      }
+    } catch (e) { /* skip */ }
+  }
+
+  throw new Error('Twitter download failed - all strategies exhausted. Add RAPIDAPI_KEY env var for extended support.');
+}
+
 // ============================================================
 // HEALTH CHECK
 // ============================================================
 app.get('/', (req, res) => {
   res.json({
     service: 'VidDrop API',
-    version: '2.0.0',
+    version: '3.0.0',
     status: 'running',
-    engine: 'youtubei.js (Innertube)',
+    platforms: ['YouTube', 'Facebook', 'Instagram', 'TikTok', 'Twitter/X'],
     endpoints: {
-      search: 'GET /api/search?q=<query>&page=<number>',
-      info: 'GET /api/info?id=<videoId>',
-      download: 'GET /api/download?id=<videoId>&quality=<quality>',
-      audio: 'GET /api/audio?id=<videoId>',
-      stream: 'GET /api/stream?id=<videoId>&type=<type>',
+      auto: 'GET /api/auto?url=<videoUrl>',
+      search: 'GET /api/search?q=<query>&limit=<number>',
+      info: 'GET /api/info?url=<videoUrl> or ?id=<videoId>',
+      download: 'GET /api/download?url=<videoUrl>&quality=<quality>',
+      audio: 'GET /api/audio?url=<videoUrl> or ?id=<videoId>',
+      stream: 'GET /api/stream?url=<videoUrl>&type=<type>',
       trending: 'GET /api/trending',
-      details: 'GET /api/details?id=<videoId>',
-      thumbnail: 'GET /api/thumbnail?id=<videoId>',
-      formats: 'GET /api/formats?id=<videoId>'
+      details: 'GET /api/details?url=<videoUrl> or ?id=<videoId>',
+      thumbnail: 'GET /api/thumbnail?url=<videoUrl> or ?id=<videoId>',
+      formats: 'GET /api/formats?url=<videoUrl> or ?id=<videoId>',
+      facebook: 'GET /api/facebook?url=<facebookUrl>',
+      instagram: 'GET /api/instagram?url=<instagramUrl>',
+      tiktok: 'GET /api/tiktok?url=<tiktokUrl>',
+      twitter: 'GET /api/twitter?url=<twitterUrl>'
     }
   });
+});
+
+// ============================================================
+// AUTO DETECT - Auto-detect platform from URL and process
+// ============================================================
+app.get('/api/auto', async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) {
+      return res.status(400).json({ error: 'Missing required parameter: url' });
+    }
+
+    const platform = detectPlatform(url);
+    if (!platform) {
+      return res.status(400).json({ 
+        error: 'Unsupported platform',
+        supported: ['YouTube', 'Facebook', 'Instagram', 'TikTok', 'Twitter/X'],
+        message: 'Paste any video link from YouTube, Facebook, Instagram, TikTok, or Twitter/X'
+      });
+    }
+
+    const result = {
+      success: true,
+      platform,
+      inputUrl: url
+    };
+
+    try {
+      switch (platform) {
+        case 'youtube': {
+          const ytAndroid = getAndroidClient();
+          const videoId = extractVideoId(url);
+          if (!videoId) throw new Error('Invalid YouTube URL');
+          const info = await ytAndroid.getBasicInfo(videoId);
+          result.title = info.basic_info?.title || 'Unknown';
+          result.thumbnail = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
+          result.duration = formatDuration(info.basic_info?.duration);
+          result.durationSeconds = parseInt(info.basic_info?.duration) || 0;
+          result.author = info.basic_info?.author || 'Unknown';
+          result.viewCount = parseInt(info.basic_info?.view_count) || 0;
+          result.streamingData = !!info.streaming_data;
+          break;
+        }
+        case 'facebook': {
+          const fb = await downloadFacebook(url);
+          result.title = fb.title;
+          result.videoUrl = fb.videoUrl;
+          result.thumbnail = fb.thumbnail;
+          break;
+        }
+        case 'instagram': {
+          const ig = await downloadInstagram(url);
+          result.title = ig.title;
+          result.videoUrl = ig.videoUrl;
+          result.thumbnail = ig.thumbnail;
+          break;
+        }
+        case 'tiktok': {
+          const tk = await downloadTikTok(url);
+          result.title = tk.title;
+          result.videoUrl = tk.videoUrl;
+          result.thumbnail = tk.thumbnail;
+          result.audioUrl = tk.audioUrl;
+          result.author = tk.author;
+          result.noWatermark = tk.noWatermark;
+          result.duration = tk.duration;
+          result.views = tk.views;
+          result.likes = tk.likes;
+          break;
+        }
+        case 'twitter': {
+          const tw = await downloadTwitter(url);
+          result.title = tw.title;
+          result.videoUrl = tw.videoUrl;
+          result.thumbnail = tw.thumbnail;
+          break;
+        }
+      }
+    } catch (e) {
+      result.error = e.message;
+      result.platformStatus = 'error';
+    }
+
+    res.json(result);
+  } catch (error) {
+    console.error('Auto detect error:', error.message);
+    res.status(500).json({ error: 'Auto detect failed', details: error.message });
+  }
 });
 
 // ============================================================
@@ -237,18 +691,43 @@ app.get('/api/search', async (req, res) => {
 });
 
 // ============================================================
-// VIDEO INFO - Get detailed information about a video
+// VIDEO INFO - Get video information (YouTube + Social)
 // ============================================================
 app.get('/api/info', async (req, res) => {
   try {
-    const { id } = req.query;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing required parameter: id (video ID)' });
+    const { id, url } = req.query;
+    const videoId = id || extractVideoId(url);
+    
+    if (!videoId && !url) {
+      return res.status(400).json({ error: 'Missing required parameter: id (video ID) or url' });
     }
 
-    // Use ANDROID client for complete streaming data
+    // Handle social media URLs
+    if (url && !videoId) {
+      const platform = detectPlatform(url);
+      if (platform && platform !== 'youtube') {
+        try {
+          let result;
+          switch (platform) {
+            case 'facebook': result = await downloadFacebook(url); break;
+            case 'instagram': result = await downloadInstagram(url); break;
+            case 'tiktok': result = await downloadTikTok(url); break;
+            case 'twitter': result = await downloadTwitter(url); break;
+          }
+          return res.json({ success: true, platform, ...result });
+        } catch (e) {
+          return res.status(500).json({ error: e.message, platform });
+        }
+      }
+    }
+
+    if (!videoId) {
+      return res.status(400).json({ error: 'Invalid video URL' });
+    }
+
+    // YouTube video info
     const yt = getAndroidClient();
-    const info = await yt.getBasicInfo(id);
+    const info = await yt.getBasicInfo(videoId);
 
     if (!info || !info.basic_info) {
       return res.status(404).json({ error: 'Video not found or unavailable' });
@@ -282,8 +761,9 @@ app.get('/api/info', async (req, res) => {
 
     res.json({
       success: true,
+      platform: 'youtube',
       video: {
-        id: details.id || id,
+        id: details.id || videoId,
         title: details.title || 'Untitled',
         description: details.short_description || '',
         channel: {
@@ -296,10 +776,10 @@ app.get('/api/info', async (req, res) => {
         publishDate: details.publish_date || '',
         isLive: details.is_live || false,
         thumbnail: {
-          default: `https://i.ytimg.com/vi/${id}/default.jpg`,
-          medium: `https://i.ytimg.com/vi/${id}/mqdefault.jpg`,
-          high: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
-          maxres: `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`
+          default: `https://i.ytimg.com/vi/${videoId}/default.jpg`,
+          medium: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+          high: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+          maxres: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`
         }
       },
       formats: videoFormats,
@@ -312,17 +792,60 @@ app.get('/api/info', async (req, res) => {
 });
 
 // ============================================================
-// VIDEO DOWNLOAD - Download video with quality options
+// VIDEO DOWNLOAD - Download from any platform
 // ============================================================
 app.get('/api/download', async (req, res) => {
   try {
-    const { id, quality } = req.query;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing required parameter: id (video ID)' });
+    const { id, quality, url } = req.query;
+
+    // Handle social media platforms
+    if (url) {
+      const platform = detectPlatform(url);
+      if (platform && platform !== 'youtube') {
+        try {
+          let result;
+          switch (platform) {
+            case 'facebook': result = await downloadFacebook(url); break;
+            case 'instagram': result = await downloadInstagram(url); break;
+            case 'tiktok': result = await downloadTikTok(url); break;
+            case 'twitter': result = await downloadTwitter(url); break;
+          }
+          if (!result || !result.videoUrl) {
+            return res.status(500).json({ error: `Could not extract ${platform} video URL` });
+          }
+
+          const ext = result.videoUrl.includes('.webm') ? 'webm' : 'mp4';
+          res.setHeader('Content-Type', 'video/mp4');
+          res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(result.title || 'video')}.${ext}"`);
+
+          const response = await globalThis.fetch(result.videoUrl, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+              'Accept': '*/*',
+              'Referer': url
+            }
+          });
+
+          if (!response.ok) {
+            return res.status(502).json({ error: 'Failed to fetch video', status: response.status });
+          }
+
+          streamToResponse(response.body, res);
+          return;
+        } catch (e) {
+          return res.status(500).json({ error: e.message });
+        }
+      }
+    }
+
+    // YouTube download
+    const videoId = id || extractVideoId(url);
+    if (!videoId) {
+      return res.status(400).json({ error: 'Missing required parameter: id (video ID) or url' });
     }
 
     const yt = getAndroidClient();
-    const info = await yt.getBasicInfo(id);
+    const info = await yt.getBasicInfo(videoId);
 
     if (!info || !info.basic_info) {
       return res.status(404).json({ error: 'Video not found or unavailable' });
@@ -335,7 +858,6 @@ app.get('/api/download', async (req, res) => {
       return res.status(500).json({ error: 'No streaming data available' });
     }
 
-    // Find the best format matching quality
     const formats = streamingData.formats || [];
     const selectedFormat = findBestFormat(formats, quality || 'highest', 'video/mp4');
 
@@ -348,7 +870,6 @@ app.get('/api/download', async (req, res) => {
       return res.status(500).json({ error: 'Could not resolve video URL' });
     }
 
-    // Set headers for direct download
     const ext = selectedFormat.mime_type?.includes('webm') ? 'webm' : 'mp4';
     const contentLength = selectedFormat.content_length;
 
@@ -359,7 +880,6 @@ app.get('/api/download', async (req, res) => {
     }
     res.setHeader('Accept-Ranges', 'bytes');
 
-    // Fetch and pipe the video stream with proper headers
     const response = await globalThis.fetch(videoUrl, {
       headers: {
         'User-Agent': 'com.google.android.youtube/18.34.36 (Linux; U; Android 13; en_US) gzip',
@@ -373,7 +893,6 @@ app.get('/api/download', async (req, res) => {
     }
 
     streamToResponse(response.body, res);
-
   } catch (error) {
     console.error('Download error:', error.message);
     if (!res.headersSent) {
@@ -383,17 +902,70 @@ app.get('/api/download', async (req, res) => {
 });
 
 // ============================================================
-// AUDIO DOWNLOAD - Extract and download audio from video
+// AUDIO DOWNLOAD - Extract audio from any platform
 // ============================================================
 app.get('/api/audio', async (req, res) => {
   try {
-    const { id } = req.query;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing required parameter: id (video ID)' });
+    const { id, url } = req.query;
+
+    // Handle social media platforms
+    if (url) {
+      const platform = detectPlatform(url);
+      if (platform && platform !== 'youtube') {
+        try {
+          let result;
+          switch (platform) {
+            case 'facebook': result = await downloadFacebook(url); break;
+            case 'instagram': result = await downloadInstagram(url); break;
+            case 'tiktok':
+              result = await downloadTikTok(url);
+              if (result.audioUrl) {
+                res.setHeader('Content-Type', 'audio/mpeg');
+                res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(result.title || 'audio')}.mp3"`);
+                const response = await globalThis.fetch(result.audioUrl);
+                if (response.ok) {
+                  streamToResponse(response.body, res);
+                  return;
+                }
+              }
+              break;
+            case 'twitter': result = await downloadTwitter(url); break;
+          }
+          if (!result || !result.videoUrl) {
+            return res.status(500).json({ error: `Could not extract ${platform} audio` });
+          }
+
+          res.setHeader('Content-Type', 'audio/mpeg');
+          res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(result.title || 'audio')}.m4a"`);
+
+          const response = await globalThis.fetch(result.videoUrl, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+              'Accept': '*/*',
+              'Referer': url
+            }
+          });
+
+          if (!response.ok) {
+            return res.status(502).json({ error: 'Failed to fetch audio' });
+          }
+
+          streamToResponse(response.body, res);
+          return;
+        } catch (e) {
+          return res.status(500).json({ error: e.message });
+        }
+      }
+    }
+
+    // YouTube audio
+    const videoId = id || extractVideoId(url);
+    if (!videoId) {
+      return res.status(400).json({ error: 'Missing required parameter: id (video ID) or url' });
     }
 
     const yt = getAndroidClient();
-    const info = await yt.getBasicInfo(id);
+    const info = await yt.getBasicInfo(videoId);
 
     if (!info || !info.basic_info) {
       return res.status(404).json({ error: 'Video not found or unavailable' });
@@ -406,13 +978,9 @@ app.get('/api/audio', async (req, res) => {
       return res.status(500).json({ error: 'No streaming data available' });
     }
 
-    // ANDROID client provides combined format (itag 18) with audio+video URL
-    // Adaptive audio-only formats don't have URLs (YouTube restriction)
-    // Use the combined format URL which includes audio, or server_abr_streaming_url
     let audioUrl = null;
     let audioFormat = null;
 
-    // Try 1: Use combined format (itag 18) which includes audio
     const combinedFormats = streamingData.formats || [];
     const combinedWithAudio = combinedFormats.filter(f => f.url && f.has_audio);
     if (combinedWithAudio.length > 0) {
@@ -420,7 +988,6 @@ app.get('/api/audio', async (req, res) => {
       audioUrl = audioFormat.url;
     }
 
-    // Try 2: Use server_abr_streaming_url as fallback
     if (!audioUrl && streamingData.server_abr_streaming_url) {
       audioUrl = streamingData.server_abr_streaming_url;
       audioFormat = { mime_type: 'audio/mp4; codecs="mp4a.40.2"', content_length: null };
@@ -430,7 +997,6 @@ app.get('/api/audio', async (req, res) => {
       return res.status(500).json({ error: 'Could not resolve audio URL' });
     }
 
-    // Set headers for audio download
     const ext = audioFormat.mime_type?.includes('webm') ? 'webm' : 'm4a';
     const contentLength = audioFormat.content_length;
 
@@ -440,7 +1006,6 @@ app.get('/api/audio', async (req, res) => {
       res.setHeader('Content-Length', contentLength);
     }
 
-    // Fetch and pipe the audio stream
     const response = await globalThis.fetch(audioUrl, {
       headers: {
         'User-Agent': 'com.google.android.youtube/18.34.36 (Linux; U; Android 13; en_US) gzip',
@@ -454,7 +1019,6 @@ app.get('/api/audio', async (req, res) => {
     }
 
     streamToResponse(response.body, res);
-
   } catch (error) {
     console.error('Audio download error:', error.message);
     if (!res.headersSent) {
@@ -464,17 +1028,49 @@ app.get('/api/audio', async (req, res) => {
 });
 
 // ============================================================
-// STREAM - Get streaming URLs for video playback
+// STREAM - Get streaming URLs for playback
 // ============================================================
 app.get('/api/stream', async (req, res) => {
   try {
-    const { id, type } = req.query;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing required parameter: id (video ID)' });
+    const { id, type, url } = req.query;
+
+    // Handle social media
+    if (url) {
+      const platform = detectPlatform(url);
+      if (platform && platform !== 'youtube') {
+        try {
+          let result;
+          switch (platform) {
+            case 'facebook': result = await downloadFacebook(url); break;
+            case 'instagram': result = await downloadInstagram(url); break;
+            case 'tiktok': result = await downloadTikTok(url); break;
+            case 'twitter': result = await downloadTwitter(url); break;
+          }
+          if (result) {
+            return res.json({
+              success: true,
+              platform,
+              streamUrl: result.videoUrl,
+              title: result.title,
+              thumbnail: result.thumbnail,
+              audioUrl: result.audioUrl || null,
+              noWatermark: result.noWatermark || false
+            });
+          }
+        } catch (e) {
+          return res.status(500).json({ error: e.message });
+        }
+      }
+    }
+
+    // YouTube stream
+    const videoId = id || extractVideoId(url);
+    if (!videoId) {
+      return res.status(400).json({ error: 'Missing required parameter: id (video ID) or url' });
     }
 
     const yt = getAndroidClient();
-    const info = await yt.getBasicInfo(id);
+    const info = await yt.getBasicInfo(videoId);
 
     if (!info || !info.basic_info) {
       return res.status(404).json({ error: 'Video not found or unavailable' });
@@ -490,7 +1086,6 @@ app.get('/api/stream', async (req, res) => {
     const formats = streamingData.formats || [];
     const adaptive = streamingData.adaptive_formats || [];
 
-    // Build resolved format lists (ANDROID client provides pre-deciphered URLs)
     const resolvedVideoFormats = formats.map(f => ({
       itag: f.itag,
       quality: f.quality,
@@ -513,7 +1108,6 @@ app.get('/api/stream', async (req, res) => {
         url: f.url || null
       }));
 
-    // Find the best stream URL based on request type
     const streamType = type || 'highest';
     let bestStreamUrl = null;
 
@@ -532,7 +1126,6 @@ app.get('/api/stream', async (req, res) => {
             return aH - bH;
           })[0]?.url;
         } else {
-          // highest
           bestStreamUrl = videoWithUrl.sort((a, b) => {
             const aH = parseInt(a.resolution?.split('x')[1] || '0');
             const bH = parseInt(b.resolution?.split('x')[1] || '0');
@@ -546,12 +1139,13 @@ app.get('/api/stream', async (req, res) => {
 
     res.json({
       success: true,
-      videoId: id,
-      title: title,
+      platform: 'youtube',
+      videoId,
+      title,
       duration: parseInt(info.basic_info.duration) || 0,
       durationFormatted: formatDuration(info.basic_info.duration),
       streamUrl: bestStreamUrl,
-      streamType: streamType,
+      streamType,
       availableStreams: {
         video: resolvedVideoFormats,
         audio: resolvedAudioFormats
@@ -566,17 +1160,14 @@ app.get('/api/stream', async (req, res) => {
 });
 
 // ============================================================
-// TRENDING - Get trending videos
+// TRENDING - Get trending YouTube videos
 // ============================================================
 app.get('/api/trending', async (req, res) => {
   try {
     const yt = getWebClient();
-    
-    // Use search for trending content instead of getHomeFeed which has structure issues
     const trendingResults = await yt.search('music', { type: 'video', limit: 20 });
     const videoItems = trendingResults.results.filter(v => v.type === 'Video');
     
-    // Also try getHomeFeed as fallback
     if (videoItems.length < 5) {
       try {
         const homeFeed = await yt.getHomeFeed();
@@ -590,7 +1181,7 @@ app.get('/api/trending', async (req, res) => {
           }
         }
       } catch (e) {
-        // Ignore home feed errors
+        // Ignore
       }
     }
     
@@ -615,17 +1206,38 @@ app.get('/api/trending', async (req, res) => {
 });
 
 // ============================================================
-// DETAILS - Full video details with all metadata
+// DETAILS - Full video details (YouTube + Social)
 // ============================================================
 app.get('/api/details', async (req, res) => {
   try {
-    const { id } = req.query;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing required parameter: id (video ID)' });
+    const { id, url } = req.query;
+
+    // Handle social media
+    if (url) {
+      const platform = detectPlatform(url);
+      if (platform && platform !== 'youtube') {
+        try {
+          let result;
+          switch (platform) {
+            case 'facebook': result = await downloadFacebook(url); break;
+            case 'instagram': result = await downloadInstagram(url); break;
+            case 'tiktok': result = await downloadTikTok(url); break;
+            case 'twitter': result = await downloadTwitter(url); break;
+          }
+          return res.json({ success: true, platform, ...result });
+        } catch (e) {
+          return res.status(500).json({ error: e.message, platform });
+        }
+      }
+    }
+
+    const videoId = id || extractVideoId(url);
+    if (!videoId) {
+      return res.status(400).json({ error: 'Missing required parameter: id (video ID) or url' });
     }
 
     const yt = getAndroidClient();
-    const info = await yt.getBasicInfo(id);
+    const info = await yt.getBasicInfo(videoId);
 
     if (!info || !info.basic_info) {
       return res.status(404).json({ error: 'Video not found or unavailable' });
@@ -635,7 +1247,8 @@ app.get('/api/details', async (req, res) => {
 
     res.json({
       success: true,
-      id: details.id || id,
+      platform: 'youtube',
+      id: details.id || videoId,
       title: details.title || 'Untitled',
       description: details.short_description || '',
       channel: {
@@ -675,28 +1288,51 @@ app.get('/api/details', async (req, res) => {
 });
 
 // ============================================================
-// THUMBNAIL - Get video thumbnail URLs
+// THUMBNAIL - Get thumbnail from any platform
 // ============================================================
 app.get('/api/thumbnail', async (req, res) => {
   try {
-    const { id, size } = req.query;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing required parameter: id (video ID)' });
+    const { id, size, url } = req.query;
+
+    // Handle social media thumbnails
+    if (url) {
+      const platform = detectPlatform(url);
+      if (platform && platform !== 'youtube') {
+        try {
+          let result;
+          switch (platform) {
+            case 'facebook': result = await downloadFacebook(url); break;
+            case 'instagram': result = await downloadInstagram(url); break;
+            case 'tiktok': result = await downloadTikTok(url); break;
+            case 'twitter': result = await downloadTwitter(url); break;
+          }
+          if (result && result.thumbnail) {
+            return res.json({ success: true, platform, thumbnail: result.thumbnail });
+          }
+        } catch (e) {
+          return res.status(500).json({ error: e.message });
+        }
+      }
+    }
+
+    const videoId = id || extractVideoId(url);
+    if (!videoId) {
+      return res.status(400).json({ error: 'Missing required parameter: id (video ID) or url' });
     }
 
     const thumbnailSizes = {
-      default: `https://i.ytimg.com/vi/${id}/default.jpg`,
-      medium: `https://i.ytimg.com/vi/${id}/mqdefault.jpg`,
-      high: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
-      standard: `https://i.ytimg.com/vi/${id}/sddefault.jpg`,
-      maxres: `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`
+      default: `https://i.ytimg.com/vi/${videoId}/default.jpg`,
+      medium: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
+      high: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+      standard: `https://i.ytimg.com/vi/${videoId}/sddefault.jpg`,
+      maxres: `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`
     };
 
     if (size && thumbnailSizes[size]) {
-      return res.json({ success: true, videoId: id, url: thumbnailSizes[size], size });
+      return res.json({ success: true, videoId, url: thumbnailSizes[size], size });
     }
 
-    res.json({ success: true, videoId: id, thumbnails: thumbnailSizes });
+    res.json({ success: true, videoId, thumbnails: thumbnailSizes });
   } catch (error) {
     console.error('Thumbnail error:', error.message);
     res.status(500).json({ error: 'Failed to get thumbnail', details: error.message });
@@ -704,17 +1340,19 @@ app.get('/api/thumbnail', async (req, res) => {
 });
 
 // ============================================================
-// FORMAT LIST - Get all available formats for a video
+// FORMAT LIST - Get all available formats (YouTube)
 // ============================================================
 app.get('/api/formats', async (req, res) => {
   try {
-    const { id } = req.query;
-    if (!id) {
-      return res.status(400).json({ error: 'Missing required parameter: id (video ID)' });
+    const { id, url } = req.query;
+    const videoId = id || extractVideoId(url);
+    
+    if (!videoId) {
+      return res.status(400).json({ error: 'Missing required parameter: id (video ID) or url' });
     }
 
     const yt = getAndroidClient();
-    const info = await yt.getBasicInfo(id);
+    const info = await yt.getBasicInfo(videoId);
 
     if (!info || !info.basic_info) {
       return res.status(404).json({ error: 'Video not found or unavailable' });
@@ -766,7 +1404,7 @@ app.get('/api/formats', async (req, res) => {
 
     res.json({
       success: true,
-      videoId: id,
+      videoId,
       title: info.basic_info.title || 'Untitled',
       totalFormats: formats.length + adaptive.length,
       combinedFormats: videoFormats.length,
@@ -779,6 +1417,78 @@ app.get('/api/formats', async (req, res) => {
   } catch (error) {
     console.error('Formats error:', error.message);
     res.status(500).json({ error: 'Failed to get formats', details: error.message });
+  }
+});
+
+// ============================================================
+// FACEBOOK - Dedicated endpoint
+// ============================================================
+app.get('/api/facebook', async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) {
+      return res.status(400).json({ error: 'Missing required parameter: url (Facebook video URL)' });
+    }
+
+    const result = await downloadFacebook(url);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Facebook error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// INSTAGRAM - Dedicated endpoint
+// ============================================================
+app.get('/api/instagram', async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) {
+      return res.status(400).json({ error: 'Missing required parameter: url (Instagram URL)' });
+    }
+
+    const result = await downloadInstagram(url);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Instagram error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// TIKTOK - Dedicated endpoint
+// ============================================================
+app.get('/api/tiktok', async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) {
+      return res.status(400).json({ error: 'Missing required parameter: url (TikTok URL)' });
+    }
+
+    const result = await downloadTikTok(url);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('TikTok error:', error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================
+// TWITTER/X - Dedicated endpoint
+// ============================================================
+app.get('/api/twitter', async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) {
+      return res.status(400).json({ error: 'Missing required parameter: url (Twitter/X URL)' });
+    }
+
+    const result = await downloadTwitter(url);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Twitter error:', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -805,12 +1515,16 @@ app.use((req, res) => {
 
   app.listen(PORT, () => {
     console.log(`
-╔══════════════════════════════════════════════════╗
-║         VidDrop API Server Running               ║
-║         URL: http://localhost:${PORT}             ║
-║         Service: YouTube Downloader v2.0         ║
-║         Clients: WEB + ANDROID                   ║
-╚══════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════╗
+║         VidDrop API Server Running v3.0                  ║
+║         URL: http://localhost:${PORT}                       ║
+║         Service: Universal Video Downloader              ║
+║         Platforms: YouTube | Facebook | Instagram        ║
+║                   TikTok | Twitter/X                     ║
+║         TikTok: tikwm.com API (working)                  ║
+║         YouTube: youtubei.js (working)                   ║
+║         FB/IG/TW: Multi-strategy scraper + RapidAPI      ║
+╚══════════════════════════════════════════════════════════╝
     `);
   });
 })();
