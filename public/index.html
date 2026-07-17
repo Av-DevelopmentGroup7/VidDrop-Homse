@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VidDrop Professional - Service Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: #f8fafc; }
+        .glass { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); }
+        .gradient-text { background: linear-gradient(90deg, #38bdf8, #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .video-card:hover { transform: translateY(-5px); transition: all 0.3s ease; }
+    </style>
+</head>
+<body class="min-h-screen pb-20">
+    <nav class="p-6 glass sticky top-0 z-50">
+        <div class="max-w-6xl mx-auto flex justify-between items-center">
+            <div class="flex items-center gap-2">
+                <i class="fas fa-cloud-arrow-down text-3xl text-sky-400"></i>
+                <h1 class="text-2xl font-bold gradient-text">VidDrop Pro</h1>
+            </div>
+            <div class="hidden md:flex gap-6 text-sm font-medium">
+                <a href="#search" class="hover:text-sky-400">Search</a>
+                <a href="#download" class="hover:text-sky-400">Download Any URL</a>
+                <a href="#trending" class="hover:text-sky-400">Trending</a>
+            </div>
+        </div>
+    </nav>
+
+    <main class="max-w-6xl mx-auto px-6 pt-12">
+        <!-- Hero Section -->
+        <section class="text-center mb-16">
+            <h2 class="text-4xl md:text-6xl font-extrabold mb-4">Universal Video Service</h2>
+            <p class="text-slate-400 text-lg max-w-2xl mx-auto">One powerful API for YouTube, TikTok, Facebook, Instagram, and Twitter. Search, Watch, and Download in seconds.</p>
+        </section>
+
+        <!-- Search & Auto Section -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-16">
+            <!-- Search YouTube -->
+            <div class="glass p-8 rounded-2xl" id="search">
+                <h3 class="text-xl font-bold mb-6 flex items-center gap-2">
+                    <i class="fab fa-youtube text-red-500"></i> Search YouTube
+                </h3>
+                <div class="flex gap-2">
+                    <input type="text" id="searchInput" placeholder="Search videos..." class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-sky-500">
+                    <button onclick="searchVideos()" class="bg-sky-500 hover:bg-sky-600 px-6 py-2 rounded-lg font-semibold transition">Search</button>
+                </div>
+            </div>
+
+            <!-- Auto Download Any URL -->
+            <div class="glass p-8 rounded-2xl" id="download">
+                <h3 class="text-xl font-bold mb-6 flex items-center gap-2">
+                    <i class="fas fa-link text-sky-400"></i> Paste Any Video Link
+                </h3>
+                <div class="flex gap-2">
+                    <input type="text" id="urlInput" placeholder="TikTok, Facebook, Instagram, YouTube..." class="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-sky-500">
+                    <button onclick="processUrl()" class="bg-indigo-500 hover:bg-indigo-600 px-6 py-2 rounded-lg font-semibold transition">Process</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Loading State -->
+        <div id="loading" class="hidden flex flex-col items-center py-20">
+            <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-sky-500 mb-4"></div>
+            <p class="text-slate-400">Processing request...</p>
+        </div>
+
+        <!-- Results Section -->
+        <div id="results" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            <!-- Dynamic Results -->
+        </div>
+
+        <!-- Preview Modal -->
+        <div id="previewModal" class="fixed inset-0 bg-black/90 z-[100] hidden flex items-center justify-center p-4">
+            <div class="max-w-4xl w-full glass rounded-3xl overflow-hidden relative">
+                <button onclick="closeModal()" class="absolute top-4 right-4 text-white text-2xl hover:text-red-500 z-10"><i class="fas fa-times"></i></button>
+                <div id="modalContent" class="p-6">
+                    <!-- Dynamic Modal Content -->
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        const API_BASE = window.location.origin;
+
+        function showLoading(show) {
+            document.getElementById('loading').classList.toggle('hidden', !show);
+            if (show) document.getElementById('results').innerHTML = '';
+        }
+
+        async function searchVideos() {
+            const query = document.getElementById('searchInput').value;
+            if (!query) return;
+            showLoading(true);
+            try {
+                const res = await fetch(`${API_BASE}/api/search?q=${encodeURIComponent(query)}&limit=12`);
+                const data = await res.json();
+                renderResults(data.results, 'youtube');
+            } catch (err) {
+                alert('Search failed: ' + err.message);
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        async function processUrl() {
+            const url = document.getElementById('urlInput').value;
+            if (!url) return;
+            showLoading(true);
+            try {
+                const res = await fetch(`${API_BASE}/api/auto?url=${encodeURIComponent(url)}`);
+                const data = await res.json();
+                if (data.success) {
+                    renderSingleResult(data);
+                } else {
+                    alert('Error: ' + (data.error || 'Failed to process URL'));
+                }
+            } catch (err) {
+                alert('Processing failed: ' + err.message);
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        function renderResults(results, platform) {
+            const container = document.getElementById('results');
+            container.innerHTML = results.map(item => `
+                <div class="glass rounded-xl overflow-hidden video-card cursor-pointer" onclick="showPreview('${item.id}', '${platform}')">
+                    <div class="relative aspect-video">
+                        <img src="${item.thumbnail}" class="w-full h-full object-cover">
+                        <div class="absolute bottom-2 right-2 bg-black/80 px-2 py-1 rounded text-xs">${item.duration}</div>
+                    </div>
+                    <div class="p-4">
+                        <h4 class="font-bold line-clamp-2 mb-2">${item.title}</h4>
+                        <p class="text-slate-400 text-sm mb-4">${item.channel?.name || item.author || ''}</p>
+                        <div class="flex gap-2">
+                            <button class="flex-1 bg-sky-500/20 text-sky-400 hover:bg-sky-500 hover:text-white py-2 rounded-lg text-sm font-bold transition">Watch & Download</button>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderSingleResult(data) {
+            const container = document.getElementById('results');
+            container.innerHTML = `
+                <div class="col-span-full max-w-xl mx-auto w-full glass rounded-xl overflow-hidden">
+                    <div class="relative aspect-video">
+                        <img src="${data.thumbnail}" class="w-full h-full object-cover">
+                        ${data.duration ? `<div class="absolute bottom-2 right-2 bg-black/80 px-2 py-1 rounded text-xs">${data.duration}</div>` : ''}
+                    </div>
+                    <div class="p-6">
+                        <div class="flex items-center gap-2 mb-2">
+                            <span class="px-2 py-1 bg-sky-500/20 text-sky-400 rounded text-xs font-bold uppercase">${data.platform}</span>
+                        </div>
+                        <h4 class="text-xl font-bold mb-4">${data.title}</h4>
+                        <div class="grid grid-cols-2 gap-4">
+                            <a href="${API_BASE}/api/download?url=${encodeURIComponent(data.inputUrl)}" target="_blank" class="flex items-center justify-center gap-2 bg-sky-500 hover:bg-sky-600 py-3 rounded-xl font-bold transition">
+                                <i class="fas fa-video"></i> Video
+                            </a>
+                            <a href="${API_BASE}/api/audio?url=${encodeURIComponent(data.inputUrl)}" target="_blank" class="flex items-center justify-center gap-2 bg-indigo-500 hover:bg-indigo-600 py-3 rounded-xl font-bold transition">
+                                <i class="fas fa-music"></i> Audio
+                            </a>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        async function showPreview(id, platform) {
+            if (platform !== 'youtube') return;
+            showLoading(true);
+            try {
+                const res = await fetch(`${API_BASE}/api/stream?id=${id}`);
+                const data = await res.json();
+                
+                const modal = document.getElementById('previewModal');
+                const content = document.getElementById('modalContent');
+                
+                content.innerHTML = `
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-8">
+                        <div class="aspect-video bg-black rounded-xl overflow-hidden flex items-center justify-center">
+                            ${data.streamUrl ? `
+                                <video src="${data.streamUrl}" controls class="w-full h-full" poster="${data.thumbnail || ''}"></video>
+                            ` : `
+                                <div class="text-center p-8">
+                                    <i class="fas fa-exclamation-triangle text-4xl text-yellow-500 mb-4"></i>
+                                    <p>Direct preview unavailable for this format.</p>
+                                    <p class="text-sm text-slate-400">Please use the download links below.</p>
+                                </div>
+                            `}
+                        </div>
+                        <div class="flex flex-col">
+                            <h3 class="text-2xl font-bold mb-2">${data.title}</h3>
+                            <p class="text-slate-400 mb-6">${data.durationFormatted} • YouTube</p>
+                            
+                            <div class="space-y-4 flex-1">
+                                <h4 class="font-bold text-sky-400">Download Video</h4>
+                                <div class="grid grid-cols-3 gap-2">
+                                    <a href="${API_BASE}/api/download?id=${id}&quality=360p" target="_blank" class="bg-slate-800 hover:bg-slate-700 p-2 rounded text-center text-sm">360p</a>
+                                    <a href="${API_BASE}/api/download?id=${id}&quality=720p" target="_blank" class="bg-slate-800 hover:bg-slate-700 p-2 rounded text-center text-sm">720p</a>
+                                    <a href="${API_BASE}/api/download?id=${id}&quality=highest" target="_blank" class="bg-sky-500/20 text-sky-400 hover:bg-sky-500 hover:text-white p-2 rounded text-center text-sm font-bold">Highest</a>
+                                </div>
+                                
+                                <h4 class="font-bold text-indigo-400 mt-6">Download Audio</h4>
+                                <a href="${API_BASE}/api/audio?id=${id}" target="_blank" class="block bg-indigo-500/20 text-indigo-400 hover:bg-indigo-500 hover:text-white p-3 rounded-xl text-center font-bold transition">
+                                    <i class="fas fa-music mr-2"></i> Download MP3 / M4A
+                                </a>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                modal.classList.remove('hidden');
+            } catch (err) {
+                alert('Failed to load preview: ' + err.message);
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        function closeModal() {
+            document.getElementById('previewModal').classList.add('hidden');
+            document.getElementById('modalContent').innerHTML = '';
+        }
+
+        // Load Trending on startup
+        async function loadTrending() {
+            showLoading(true);
+            try {
+                const res = await fetch(`${API_BASE}/api/trending`);
+                const data = await res.json();
+                renderResults(data.results, 'youtube');
+            } catch (err) {
+                console.error('Failed to load trending');
+            } finally {
+                showLoading(false);
+            }
+        }
+
+        window.onload = loadTrending;
+    </script>
+</body>
+</html>

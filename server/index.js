@@ -75,6 +75,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json({ limit: '10mb' }));
+app.use(express.static('public'));
 
 // ============================================================
 // YouTube Clients
@@ -85,7 +86,7 @@ let ytAndroid = null;
 async function initYouTube() {
   try {
     ytWeb = await Innertube.create({
-      retrieve_player: false,
+      retrieve_player: true,
       client_type: ClientType.WEB,
       lang: 'en',
       location: 'US'
@@ -97,7 +98,7 @@ async function initYouTube() {
 
   try {
     ytAndroid = await Innertube.create({
-      retrieve_player: false,
+      retrieve_player: true,
       client_type: ClientType.ANDROID,
       generate_session_locally: false,
       enable_session_cache: false
@@ -858,45 +859,21 @@ app.get('/api/download', async (req, res) => {
       return res.status(500).json({ error: 'No streaming data available' });
     }
 
-    const formats = streamingData.formats || [];
-    const selectedFormat = findBestFormat(formats, quality || 'highest', 'video/mp4');
+    const downloadOptions = {
+      type: 'video+audio',
+      quality: quality === 'highest' ? 'best' : (quality === 'lowest' ? 'worst' : quality)
+    };
 
-    if (!selectedFormat) {
-      return res.status(400).json({ error: 'No matching format found' });
-    }
-
-    const videoUrl = selectedFormat.url;
-    if (!videoUrl) {
-      return res.status(500).json({ error: 'Could not resolve video URL' });
-    }
-
-    const ext = selectedFormat.mime_type?.includes('webm') ? 'webm' : 'mp4';
-    const contentLength = selectedFormat.content_length;
-
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(title)}.${ext}"`);
-    if (contentLength) {
-      res.setHeader('Content-Length', contentLength);
-    }
-    res.setHeader('Accept-Ranges', 'bytes');
-
-    const response = await globalThis.fetch(videoUrl, {
-      headers: {
-        'User-Agent': 'com.google.android.youtube/18.34.36 (Linux; U; Android 13; en_US) gzip',
-        'Accept': '*/*',
-        'Accept-Encoding': 'identity;q=1, *;q=0'
-      }
-    });
-
-    if (!response.ok) {
-      return res.status(502).json({ error: 'Failed to fetch video stream', status: response.status });
-    }
-
-    streamToResponse(response.body, res);
+    const stream = await yt.download(videoId, downloadOptions);
+    
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(title)}.mp4"`);
+    
+    streamToResponse(stream, res);
   } catch (error) {
-    console.error('Download error:', error.message);
+    console.error('Download error:', error);
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Download failed', details: error.message });
+      res.status(500).json({ error: 'Download failed', details: error.message, stack: error.stack });
     }
   }
 });
@@ -978,47 +955,13 @@ app.get('/api/audio', async (req, res) => {
       return res.status(500).json({ error: 'No streaming data available' });
     }
 
-    let audioUrl = null;
-    let audioFormat = null;
-
-    const combinedFormats = streamingData.formats || [];
-    const combinedWithAudio = combinedFormats.filter(f => f.url && f.has_audio);
-    if (combinedWithAudio.length > 0) {
-      audioFormat = combinedWithAudio.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-      audioUrl = audioFormat.url;
-    }
-
-    if (!audioUrl && streamingData.server_abr_streaming_url) {
-      audioUrl = streamingData.server_abr_streaming_url;
-      audioFormat = { mime_type: 'audio/mp4; codecs="mp4a.40.2"', content_length: null };
-    }
-
-    if (!audioUrl) {
-      return res.status(500).json({ error: 'Could not resolve audio URL' });
-    }
-
-    const ext = audioFormat.mime_type?.includes('webm') ? 'webm' : 'm4a';
-    const contentLength = audioFormat.content_length;
-
+    // Audio type fails with 'No valid URL to decipher', so we use video+audio
+    const stream = await yt.download(videoId, { type: 'video+audio', quality: 'best' });
+    
     res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(title)}.${ext}"`);
-    if (contentLength) {
-      res.setHeader('Content-Length', contentLength);
-    }
-
-    const response = await globalThis.fetch(audioUrl, {
-      headers: {
-        'User-Agent': 'com.google.android.youtube/18.34.36 (Linux; U; Android 13; en_US) gzip',
-        'Accept': '*/*',
-        'Accept-Encoding': 'identity;q=1, *;q=0'
-      }
-    });
-
-    if (!response.ok) {
-      return res.status(502).json({ error: 'Failed to fetch audio stream', status: response.status });
-    }
-
-    streamToResponse(response.body, res);
+    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(title)}.mp3"`);
+    
+    streamToResponse(stream, res);
   } catch (error) {
     console.error('Audio download error:', error.message);
     if (!res.headersSent) {
@@ -1083,58 +1026,17 @@ app.get('/api/stream', async (req, res) => {
       return res.status(500).json({ error: 'No streaming data available' });
     }
 
-    const formats = streamingData.formats || [];
-    const adaptive = streamingData.adaptive_formats || [];
-
-    const resolvedVideoFormats = formats.map(f => ({
-      itag: f.itag,
-      quality: f.quality,
-      resolution: f.width && f.height ? `${f.width}x${f.height}` : null,
-      mimeType: f.mime_type,
-      bitrate: f.bitrate,
-      contentLength: f.content_length,
-      url: f.url || null,
-      fps: f.fps
-    }));
-
-    const resolvedAudioFormats = adaptive
-      .filter(f => f.has_audio && !f.has_video)
-      .map(f => ({
-        itag: f.itag,
-        quality: f.audio_quality,
-        mimeType: f.mime_type,
-        bitrate: f.bitrate,
-        contentLength: f.content_length,
-        url: f.url || null
-      }));
-
     const streamType = type || 'highest';
-    let bestStreamUrl = null;
-
-    if (streamType === 'audio') {
-      const bestAudio = resolvedAudioFormats
-        .filter(f => f.url)
-        .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
-      bestStreamUrl = bestAudio?.url || null;
-    } else {
-      const videoWithUrl = resolvedVideoFormats.filter(f => f.url && f.resolution);
-      if (videoWithUrl.length > 0) {
-        if (streamType === 'lowest') {
-          bestStreamUrl = videoWithUrl.sort((a, b) => {
-            const aH = parseInt(a.resolution?.split('x')[1] || '0');
-            const bH = parseInt(b.resolution?.split('x')[1] || '0');
-            return aH - bH;
-          })[0]?.url;
-        } else {
-          bestStreamUrl = videoWithUrl.sort((a, b) => {
-            const aH = parseInt(a.resolution?.split('x')[1] || '0');
-            const bH = parseInt(b.resolution?.split('x')[1] || '0');
-            return bH - aH;
-          })[0]?.url;
-        }
+    let streamObj;
+    
+    try {
+      if (streamType === 'audio') {
+        streamObj = await yt.download(videoId, { type: 'audio', quality: 'best' });
       } else {
-        bestStreamUrl = resolvedVideoFormats.find(f => f.url)?.url || null;
+        streamObj = await yt.download(videoId, { type: 'video+audio', quality: streamType === 'lowest' ? 'worst' : 'best' });
       }
+    } catch (e) {
+      streamObj = null;
     }
 
     res.json({
@@ -1144,12 +1046,8 @@ app.get('/api/stream', async (req, res) => {
       title,
       duration: parseInt(info.basic_info.duration) || 0,
       durationFormatted: formatDuration(info.basic_info.duration),
-      streamUrl: bestStreamUrl,
+      streamUrl: streamObj ? (streamObj.url || null) : null,
       streamType,
-      availableStreams: {
-        video: resolvedVideoFormats,
-        audio: resolvedAudioFormats
-      },
       dashManifestUrl: streamingData.dash_manifest_url || null,
       hlsManifestUrl: streamingData.hls_manifest_url || null
     });
