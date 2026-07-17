@@ -21,6 +21,10 @@ const cors = require('cors');
 const { Innertube, Platform, ClientType } = require('youtubei.js');
 const axios = require('axios');
 const https = require('https');
+const { execSync, exec } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 // Trust self-signed certs for scraper APIs
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -955,13 +959,55 @@ app.get('/api/audio', async (req, res) => {
       return res.status(500).json({ error: 'No streaming data available' });
     }
 
-    // Audio type fails with 'No valid URL to decipher', so we use video+audio
-    const stream = await yt.download(videoId, { type: 'video+audio', quality: 'best' });
+    // Get the combined format (itag 18) URL from ANDROID client
+    // This is the only format with a deciphered URL
+    const combinedFormats = streamingData.formats || [];
+    const combinedFormat = combinedFormats.find(f => f.url && f.has_audio && f.has_video);
     
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(title)}.mp3"`);
+    if (!combinedFormat || !combinedFormat.url) {
+      return res.status(500).json({ error: 'No combined format available for audio extraction' });
+    }
     
-    streamToResponse(stream, res);
+    const videoUrl = combinedFormat.url;
+    
+    const tmpVideo = path.join(os.tmpdir(), `viddrop_${Date.now()}.mp4`);
+    const tmpAudio = path.join(os.tmpdir(), `viddrop_${Date.now()}.m4a`);
+    
+    try {
+      // Download the video using the direct URL
+      execSync(`curl -s -L -H "User-Agent: com.google.android.youtube/18.34.36 (Linux; U; Android 13; en_US) gzip" -o "${tmpVideo}" "${videoUrl}"`, { timeout: 60000 });
+      
+      // Extract audio using ffmpeg
+      execSync(`ffmpeg -i "${tmpVideo}" -vn -acodec copy "${tmpAudio}" -y 2>/dev/null`, { timeout: 60000 });
+      
+      // Stream the audio file to the response
+      const audioStats = fs.statSync(tmpAudio);
+      res.setHeader('Content-Type', 'audio/mp4');
+      res.setHeader('Content-Disposition', `attachment; filename="${sanitizeFilename(title)}.m4a"`);
+      res.setHeader('Content-Length', audioStats.size);
+      
+      const audioReadStream = fs.createReadStream(tmpAudio);
+      audioReadStream.pipe(res);
+      
+      audioReadStream.on('end', () => {
+        // Cleanup temp files
+        fs.unlinkSync(tmpVideo);
+        fs.unlinkSync(tmpAudio);
+      });
+      
+      audioReadStream.on('error', () => {
+        fs.unlinkSync(tmpVideo);
+        try { fs.unlinkSync(tmpAudio); } catch (e) {}
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to stream audio file' });
+        }
+      });
+    } catch (error) {
+      // Cleanup on error
+      try { fs.unlinkSync(tmpVideo); } catch (e) {}
+      try { fs.unlinkSync(tmpAudio); } catch (e) {}
+      throw error;
+    }
   } catch (error) {
     console.error('Audio download error:', error.message);
     if (!res.headersSent) {
